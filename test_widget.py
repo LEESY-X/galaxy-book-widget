@@ -1,5 +1,7 @@
 """Focused edge-case checks. Does not create windows or change system settings."""
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import widget
@@ -7,6 +9,18 @@ from telemetry import _LibreSensors, _battery_seconds
 
 
 class WidgetFormattingTests(unittest.TestCase):
+    def test_compact_default_and_existing_zoom_settings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder)/"settings.json"
+            with patch.object(widget,"CONFIG",config):
+                self.assertEqual(widget.load_settings()["zoom"],0.9)
+                config.write_text('{"zoom":1.25,"interval":5}',encoding="utf-8")
+                settings = widget.load_settings()
+                self.assertEqual(settings["zoom"],1.25)
+                self.assertEqual(settings["interval"],5)
+                config.write_text('{"zoom":-1}',encoding="utf-8")
+                self.assertEqual(widget.load_settings()["zoom"],0.9)
+
     def test_unsupported_sections_are_hidden(self):
         plan = dict(widget.section_plan({"battery":True,"performance_mode":True,"battery_watts":True}))
         self.assertNotIn("fan", plan)

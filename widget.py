@@ -26,8 +26,8 @@ DIM = "#798693"
 MINT = "#9be9bb"
 LINE = "#45505c"
 PILL = "#304f43"
-KEY = "#010203"
-DEFAULTS = {"pinned": True, "zoom": 1.0, "interval": 2, "sensor_url": None}
+ZOOM_LEVELS = (0.9, 1.0, 1.1, 1.25, 1.5)
+DEFAULTS = {"pinned": True, "zoom": 0.9, "interval": 2, "sensor_url": None}
 
 
 def load_settings():
@@ -42,7 +42,7 @@ def load_settings():
                 result[key] = stored[key]
     except (OSError, ValueError, TypeError):
         pass
-    result["zoom"] = result["zoom"] if result["zoom"] in (1.0, 1.1, 1.25, 1.5) else 1.0
+    result["zoom"] = result["zoom"] if result["zoom"] in ZOOM_LEVELS else DEFAULTS["zoom"]
     result["interval"] = result["interval"] if result["interval"] in (2, 5) else 2
     result["pinned"] = bool(result["pinned"])
     if result.get("sensor_url") not in (None, "http://127.0.0.1:8085/data.json", "http://localhost:8085/data.json"):
@@ -150,7 +150,10 @@ class Widget:
         self.current_height = None
         self.history = deque(maxlen=40)
         self.fonts = {}
-        self.drag_origin = None
+        self.moving = False
+        self.move_finished = False
+        self.native_hwnd = None
+        self.clip_size = None
         self.notification = None
         self.old_proc = None
         self.proc_ref = None
@@ -158,20 +161,20 @@ class Widget:
         self.worker = threading.Thread(target=self.collect, name="metrics", daemon=True)
 
         root.title(TITLE)
-        root.configure(bg=KEY)
+        root.configure(bg=BG)
         # Keep a normal native top-level window so Alt+Tab and desktop tools can
         # find it. Only the system caption is removed, not the whole window type.
         root.overrideredirect(False)
-        root.attributes("-transparentcolor", KEY)
         root.attributes("-topmost", self.settings["pinned"])
         root.protocol("WM_DELETE_WINDOW", self.close)
-        self.canvas = tk.Canvas(root, bd=0, highlightthickness=0, bg=KEY)
+        # An opaque window avoids colour-key layered-window trails while moving.
+        # Native clipping below supplies the rounded corners instead.
+        self.canvas = tk.Canvas(root, bd=0, highlightthickness=0, bg=BG)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<ButtonPress-1>", self.pointer_down)
-        self.canvas.bind("<B1-Motion>", self.pointer_move)
-        self.canvas.bind("<ButtonRelease-1>", self.pointer_up)
         self.canvas.bind("<Button-3>", self.context_menu)
         self.canvas.bind("<Motion>", self.pointer_hover)
+        root.bind("<Configure>", self.window_configured)
         root.bind("<Escape>", lambda _: self.close_menu())
         root.bind("<Alt-F4>", lambda _: self.close())
         self.build_menu()
@@ -188,6 +191,7 @@ class Widget:
         user.GetParent.argtypes = [wintypes.HWND]
         user.GetParent.restype = wintypes.HWND
         hwnd = user.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+        self.native_hwnd = hwnd
         user.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
         user.GetWindowLongPtrW.restype = ctypes.c_ssize_t
         user.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
@@ -195,13 +199,44 @@ class Widget:
         style = user.GetWindowLongPtrW(hwnd, -16)
         user.SetWindowLongPtrW(hwnd, -16, style & ~(0x00C00000 | 0x00040000 | 0x00010000 | 0x00020000))
         exstyle = user.GetWindowLongPtrW(hwnd, -20)
-        user.SetWindowLongPtrW(hwnd, -20, (exstyle | 0x00040000) & ~0x00000080)
+        user.SetWindowLongPtrW(hwnd, -20, (exstyle | 0x00040000) & ~(0x00000080 | 0x00080000))
         user.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
         user.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
         # The launcher hides its console; explicitly show the actual widget.
         self.root.deiconify()
         user.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         user.ShowWindow(hwnd, 4)
+        self.apply_window_region()
+
+    def window_configured(self, event):
+        if event.widget is self.root:
+            self.apply_window_region()
+
+    def apply_window_region(self):
+        """Clip an opaque native window, only when its dimensions change."""
+        if not self.native_hwnd:
+            return
+        size = (self.root.winfo_width(), self.root.winfo_height())
+        if size == self.clip_size or min(size) < 2:
+            return
+        user = ctypes.WinDLL("user32",use_last_error=True)
+        gdi = ctypes.WinDLL("gdi32",use_last_error=True)
+        user.SetWindowRgn.argtypes = [wintypes.HWND,wintypes.HRGN,wintypes.BOOL]
+        user.SetWindowRgn.restype = ctypes.c_int
+        gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int]*6
+        gdi.CreateRoundRectRgn.restype = wintypes.HRGN
+        gdi.DeleteObject.argtypes = [wintypes.HANDLE]
+        gdi.DeleteObject.restype = wintypes.BOOL
+        diameter = max(2,round(self.scale(44)))
+        region = gdi.CreateRoundRectRgn(0,0,size[0]+1,size[1]+1,diameter,diameter)
+        if not region:
+            return
+        # SetWindowRgn can synchronously generate another Configure event.
+        self.clip_size = size
+        if not user.SetWindowRgn(self.native_hwnd,region,True):
+            # On success Windows owns and later deletes the region itself.
+            gdi.DeleteObject(region)
+            self.clip_size = None
 
     def scale(self, value):
         return value * self.factor
@@ -257,6 +292,8 @@ class Widget:
         self.text(right-width/2, y, label, 10, MINT if active else MUTED, anchor="center")
 
     def render(self):
+        if self.moving:
+            return
         c = self.canvas
         c.delete("all")
         d = {} if self.stale else self.sample
@@ -425,6 +462,11 @@ class Widget:
         if self.stop.is_set():
             return
         dirty = False
+        if self.move_finished:
+            self.move_finished = False
+            self.settings["x"],self.settings["y"] = self.root.winfo_x(),self.root.winfo_y()
+            save_settings(self.settings)
+            dirty = True
         try:
             data = self.results.get_nowait()
             if self.last_update and data["_received"] - self.last_update > 15:
@@ -460,7 +502,7 @@ class Widget:
         self.menu.add_checkbutton(label="항상 위에 표시", variable=self.pin_var, command=self.toggle_pin)
         size_menu = tk.Menu(self.menu, tearoff=False, background=BG, foreground=INK)
         self.zoom_var = tk.DoubleVar(value=self.settings["zoom"])
-        for zoom in (1.0,1.1,1.25,1.5):
+        for zoom in ZOOM_LEVELS:
             size_menu.add_radiobutton(label=f"{zoom*100:.0f}%", variable=self.zoom_var, value=zoom, command=self.change_zoom)
         self.menu.add_cascade(label="크기", menu=size_menu)
         interval_menu = tk.Menu(self.menu, tearoff=False, background=BG, foreground=INK)
@@ -511,18 +553,24 @@ class Widget:
         elif y < 52 and x >= 304:
             self.context_menu(event)
         elif y < 52:
-            self.drag_origin = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
+            self.move_native(event.x_root,event.y_root)
 
-    def pointer_move(self, event):
-        if self.drag_origin:
-            a,b,x,y = self.drag_origin
-            self.root.geometry(f"+{x+event.x_root-a}+{y+event.y_root-b}")
-
-    def pointer_up(self, event):
-        if self.drag_origin:
-            self.drag_origin = None
-            self.settings["x"], self.settings["y"] = self.root.winfo_x(), self.root.winfo_y()
-            save_settings(self.settings)
+    def move_native(self, x, y):
+        """Let Windows move its composited surface rather than moving per pixel."""
+        if self.moving or not self.native_hwnd:
+            return
+        user = ctypes.WinDLL("user32",use_last_error=True)
+        user.ReleaseCapture.argtypes = []
+        user.ReleaseCapture.restype = wintypes.BOOL
+        user.PostMessageW.argtypes = [wintypes.HWND,wintypes.UINT,wintypes.WPARAM,wintypes.LPARAM]
+        user.PostMessageW.restype = wintypes.BOOL
+        self.moving = True
+        user.ReleaseCapture()
+        point = (int(x) & 0xFFFF) | ((int(y) & 0xFFFF) << 16)
+        # Queue, rather than synchronously enter, the native move loop. A nested
+        # Windows loop inside a Tcl button callback can abort the interpreter.
+        if not user.PostMessageW(self.native_hwnd,0x00A1,2,point):
+            self.moving = False
 
     def pointer_hover(self, event):
         x,y = event.x/self.factor,event.y/self.factor
@@ -590,7 +638,12 @@ class Widget:
             setter.restype = ctypes.c_void_p
             def wndproc(hwnd,msg,wp,lp):
                 try:
-                    if msg == 0x0218:
+                    if msg == 0x0231:  # WM_ENTERSIZEMOVE
+                        self.moving = True
+                    elif msg == 0x0232:  # WM_EXITSIZEMOVE
+                        self.moving = False
+                        self.move_finished = True
+                    elif msg == 0x0218:
                         if wp == 0x8013 and lp:
                             value = ctypes.c_uint32.from_address(lp+20).value
                             self.awake.clear() if value == 0 else self.awake.set()
