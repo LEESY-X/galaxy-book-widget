@@ -24,7 +24,7 @@ INK = "#f1f4f7"
 MUTED = "#a3adb8"
 DIM = "#798693"
 MINT = "#9be9bb"
-LINE = "#45505c"
+LINE = "#35414c"
 PILL = "#304f43"
 ZOOM_LEVELS = (0.9, 1.0, 1.1, 1.25, 1.5)
 DEFAULTS = {"pinned": True, "zoom": 0.9, "interval": 2, "sensor_url": None}
@@ -161,7 +161,7 @@ class Widget:
         self.worker = threading.Thread(target=self.collect, name="metrics", daemon=True)
 
         root.title(TITLE)
-        root.configure(bg=BG)
+        root.configure(bg=BG,borderwidth=0,highlightthickness=0)
         # Keep a normal native top-level window so Alt+Tab and desktop tools can
         # find it. Only the system caption is removed, not the whole window type.
         root.overrideredirect(False)
@@ -199,7 +199,17 @@ class Widget:
         style = user.GetWindowLongPtrW(hwnd, -16)
         user.SetWindowLongPtrW(hwnd, -16, style & ~(0x00C00000 | 0x00040000 | 0x00010000 | 0x00020000))
         exstyle = user.GetWindowLongPtrW(hwnd, -20)
-        user.SetWindowLongPtrW(hwnd, -20, (exstyle | 0x00040000) & ~(0x00000080 | 0x00080000))
+        # Remove native raised/client/static edges as well as layered styling.
+        edges = 0x00000100 | 0x00000200 | 0x00020000
+        user.SetWindowLongPtrW(hwnd, -20, (exstyle | 0x00040000) & ~(0x00000080 | 0x00080000 | edges))
+        try:
+            dwm = ctypes.WinDLL("dwmapi")
+            dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD]
+            dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+            no_border = wintypes.DWORD(0xFFFFFFFE)  # DWMWA_COLOR_NONE
+            dwm.DwmSetWindowAttribute(hwnd,34,ctypes.byref(no_border),ctypes.sizeof(no_border))
+        except (OSError,AttributeError):
+            pass  # Older Windows versions have no DWM border-colour attribute.
         user.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
         user.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
         # The launcher hides its console; explicitly show the actual widget.
@@ -304,7 +314,8 @@ class Widget:
             self.current_height = height
             self.root.geometry(f"{round(self.scale(self.WIDTH))}x{height}")
             self.canvas.configure(height=height)
-        self.rounded(.5, .5, 339, logical_height-1, 22, BG, "#626c77", .75)
+        # The opaque canvas fills the native rounded region. Drawing a second
+        # rounded outline here leaves a visible vertical seam at some DPI scales.
         dot = "#e1bd76" if self.stale else (MINT if self.last_update else DIM)
         c.create_oval(*(self.scale(v) for v in (22,24,30,32)), fill=dot, outline="")
         self.text(39, 28, TITLE, 18, bold=True)
@@ -373,7 +384,6 @@ class Widget:
                 self.text(22,y+21,"네트워크",15,bold=True)
                 self.text(22,y+44,"↓",15,MINT)
                 self.text(40,y+44,speed(d.get("download_bps")),12.5)
-                self.line(171,y+37,171,y+50,"#596674")
                 self.text(191,y+44,"↑",15,MINT)
                 self.text(209,y+44,speed(d.get("upload_bps")),12.5)
             elif section == "fan":
