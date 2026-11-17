@@ -8,6 +8,7 @@ five seconds.  Unsupported readings are None, never made-up zeros.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import ctypes
 from ctypes import wintypes
 from datetime import datetime
@@ -344,6 +345,61 @@ def _battery_seconds(value, raw=None):
     return None
 
 
+class RemainingTimeEstimator:
+    """Time-weighted 90-second draw average, published at most every 30 seconds."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.samples = deque(maxlen=64)
+        self.source = None
+        self.result = None
+        self.published_at = None
+
+    def update(self, now, raw=None, fallback_seconds=None):
+        capacity = draw = None
+        source = None
+        if raw and not raw.get("relative"):
+            cap, rate = raw.get("capacity_mwh"),raw.get("rate")
+            if (isinstance(cap,(int,float)) and math.isfinite(cap) and cap > 0
+                    and isinstance(rate,(int,float)) and math.isfinite(rate)
+                    and rate < 0 and rate != -2147483648):
+                capacity,draw,source = cap,abs(rate),"battery_rate"
+        if source is None:
+            seconds = _battery_seconds(fallback_seconds)
+            if seconds:
+                capacity,draw,source = 1.0,3600.0/seconds,"windows_estimate"
+        if source is None:
+            self.reset()
+            return None
+        if (source != self.source or (self.samples and
+                (now <= self.samples[-1][0] or now-self.samples[-1][0] > 30))):
+            self.reset()
+        self.source = source
+        self.samples.append((now,draw))
+        cutoff = now-90
+        while len(self.samples) > 2 and self.samples[1][0] <= cutoff:
+            self.samples.popleft()
+        if len(self.samples) < 3 or now-self.samples[0][0] < 10:
+            return None
+        if self.published_at is not None and now-self.published_at < 30:
+            return self.result
+        integral = coverage = 0.0
+        for (t0,p0),(t1,p1) in zip(self.samples,list(self.samples)[1:]):
+            start,end = max(t0,cutoff),min(t1,now)
+            if end <= start or t1 <= t0:
+                continue
+            left = p0+(p1-p0)*(start-t0)/(t1-t0)
+            right = p0+(p1-p0)*(end-t0)/(t1-t0)
+            integral += (left+right)*0.5*(end-start)
+            coverage += end-start
+        average = integral/coverage if coverage else 0
+        self.result = _battery_seconds(capacity/average*3600) if average > 0 else None
+        self.published_at = now
+        return self.result
+
+
 class Collector:
     """Persistent read-only collector. Call sample() every ~2 seconds and close()."""
 
@@ -357,6 +413,7 @@ class Collector:
         self.ifaces = set()
         self.network_prev = None
         self.cpu_primed = False
+        self.remaining_time = RemainingTimeEstimator()
 
     def _read_slow(self):
         errors = {}
@@ -369,10 +426,10 @@ class Collector:
             battery = psutil.sensors_battery()
             if battery is None:
                 data["battery_state"] = "absent"
+                self.remaining_time.reset()
             else:
                 data["battery_percent"] = battery.percent
                 data["ac_connected"] = battery.power_plugged
-                data["battery_seconds"] = _battery_seconds(battery.secsleft)
                 data["battery_state"] = "plugged" if battery.power_plugged else "discharging"
                 raw = self.battery.read()
                 if raw is not None:
@@ -388,15 +445,16 @@ class Collector:
                         data["battery_state"] = "plugged"
                         data["battery_power_direction"] = "idle"
                     data["battery_watts"] = raw["watts"]
-                    if data["battery_state"] == "discharging":
-                        data["battery_seconds"] = _battery_seconds(battery.secsleft, raw)
-                    else:
-                        data["battery_seconds"] = None
                     if raw["watts"] is None:
                         errors["battery_watts"] = "unavailable"
                 else:
                     errors["battery_watts"] = "unavailable"
+                if data["battery_state"] == "discharging":
+                    data["battery_seconds"] = self.remaining_time.update(time.monotonic(),raw,battery.secsleft)
+                else:
+                    self.remaining_time.reset()
         except (OSError, psutil.Error, ValueError) as exc:
+            self.remaining_time.reset()
             errors["battery"] = type(exc).__name__
         sensor_data = self.sensors.read() if self.sensors else None
         for name in ("cpu_temp_c", "cpu_power_w", "fan_rpm"):

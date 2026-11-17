@@ -24,10 +24,11 @@ INK = "#f1f4f7"
 MUTED = "#a3adb8"
 DIM = "#798693"
 MINT = "#9be9bb"
+RED = "#f28b82"
 LINE = "#35414c"
 PILL = "#304f43"
-ZOOM_LEVELS = (0.9, 1.0, 1.1, 1.25, 1.5)
-DEFAULTS = {"pinned": True, "zoom": 0.9, "interval": 2, "sensor_url": None}
+ZOOM_LEVELS = (0.85, 0.9, 1.0, 1.1, 1.25, 1.5)
+DEFAULTS = {"pinned": True, "zoom": 0.85, "interval": 2, "sensor_url": None}
 
 
 def load_settings():
@@ -73,9 +74,19 @@ def duration(value):
         return None
     minutes = max(1, int(value / 60))
     hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"약 {hours}시간 {minutes:02d}분"
-    return f"약 {minutes}분"
+    return f"약 {hours}시간 {minutes:02d}분 남음"
+
+
+def metric_warnings(data, previous=None):
+    previous = previous or {}
+    def high(key, on, off):
+        value = data.get(key)
+        return finite(value) and (value > off if previous.get(key) else value >= on)
+    cpu = high("cpu_percent",80,70)
+    ram = high("ram_percent",85,80)
+    value = data.get("battery_percent")
+    low = finite(value) and (value < 25 if previous.get("battery_low") else value <= 20)
+    return {"cpu_percent":cpu,"ram_percent":ram,"battery_low":low,"battery":low}
 
 
 def power_value(value, direction):
@@ -88,14 +99,14 @@ def power_value(value, direction):
 def section_plan(available):
     sections = []
     if available.get("performance_mode"):
-        sections.append(("mode", 40))
-    sections.extend((("cpu", 67), ("ram", 62)))
+        sections.append(("mode", 36))
+    sections.extend((("cpu", 64), ("ram", 58)))
     if available.get("battery"):
-        sections.append(("battery", 60))
+        sections.append(("battery", 56))
     power_rows = sum(bool(available.get(key)) for key in ("battery_watts", "input_power_w", "cpu_power_w"))
     if power_rows:
-        sections.append(("power", 46 if power_rows == 1 else 36 + 21 * power_rows))
-    sections.append(("network", 64))
+        sections.append(("power", 44 if power_rows == 1 else 36 + 21 * power_rows))
+    sections.append(("network", 58))
     if available.get("fan_rpm"):
         sections.append(("fan", 48))
     return sections
@@ -147,6 +158,7 @@ class Widget:
         self.last_update = None
         self.stale = False
         self.available = {}
+        self.warnings = metric_warnings({})
         self.current_height = None
         self.history = deque(maxlen=40)
         self.fonts = {}
@@ -307,6 +319,10 @@ class Widget:
         c = self.canvas
         c.delete("all")
         d = {} if self.stale else self.sample
+        warnings = {} if self.stale else self.warnings
+        cpu_color = RED if warnings.get("cpu_percent") else MINT
+        ram_color = RED if warnings.get("ram_percent") else MINT
+        battery_color = RED if warnings.get("battery") else MINT
         sections = section_plan(self.available)
         logical_height = 64 + sum(height for _,height in sections)
         height = round(self.scale(logical_height))
@@ -332,32 +348,32 @@ class Widget:
             elif section == "cpu":
                 self.text(22,y+23,"CPU",16,bold=True)
                 has_temp = self.available.get("cpu_temp_c")
-                self.text(243 if has_temp else 318,y+23,percent(d.get("cpu_percent")),19,MINT,anchor="e")
+                self.text(243 if has_temp else 318,y+23,percent(d.get("cpu_percent")),19,cpu_color,anchor="e")
                 if has_temp:
                     self.line(256,y+15,256,y+31,"#6c7681")
                     temp = d.get("cpu_temp_c")
                     self.text(318,y+23,f"{temp:.0f}°C" if finite(temp) else "—",18,INK,anchor="e")
                 freq = d.get("cpu_ghz")
                 self.text(22,y+48,f"{freq:.2f} GHz" if finite(freq) else "",11,MUTED)
-                self.sparkline(154,y+39,164,17)
+                self.sparkline(154,y+39,164,17,cpu_color)
             elif section == "ram":
                 self.text(22,y+22,"RAM",16,bold=True)
-                self.text(318,y+22,percent(d.get("ram_percent")),19,MINT,anchor="e")
+                self.text(318,y+22,percent(d.get("ram_percent")),19,ram_color,anchor="e")
                 used,total = d.get("ram_used_gb"),d.get("ram_total_gb")
                 self.text(22,y+46,f"{used:.1f} / {total:.1f} GB" if finite(used) and finite(total) else "—",11,MUTED)
                 self.rounded(176,y+42,142,6,3,"#53606e")
                 ram = d.get("ram_percent")
                 if finite(ram) and ram > 0:
-                    self.rounded(176,y+42,max(3,142*min(100,max(0,ram))/100),6,3,MINT)
+                    self.rounded(176,y+42,max(3,142*min(100,max(0,ram))/100),6,3,ram_color)
             elif section == "battery":
-                self.draw_battery(23,y+14,d.get("battery_percent"))
+                self.draw_battery(23,y+14,d.get("battery_percent"),battery_color)
                 self.text(66,y+22,"배터리",16,bold=True)
-                self.text(318,y+22,percent(d.get("battery_percent")),19,MINT,anchor="e")
+                self.text(318,y+22,percent(d.get("battery_percent")),19,battery_color,anchor="e")
                 state = d.get("battery_state","unknown")
                 label = {"charging":"충전 중","discharging":"배터리 사용 중","plugged":"전원 연결 · 충전 대기"}.get(state,"—")
                 remaining = duration(d.get("battery_seconds"))
                 if state == "discharging" and remaining:
-                    label += " · " + remaining
+                    label = remaining
                 battery_percent = d.get("battery_percent")
                 if state in ("plugged","charging") and finite(battery_percent) and battery_percent >= 100:
                     label = "전원 연결 · 충전 완료"
@@ -400,7 +416,7 @@ class Widget:
             if index < len(sections)-1:
                 self.line(22,y,318,y)
 
-    def sparkline(self, x, y, width, height):
+    def sparkline(self, x, y, width, height, color=MINT):
         if len(self.history) < 2 or self.stale:
             self.line(x, y+height/2, x+width, y+height/2, "#4c5d60")
             return
@@ -408,13 +424,13 @@ class Widget:
         points = []
         for i, value in enumerate(values):
             points.extend((self.scale(x+i*width/(len(values)-1)), self.scale(y+height*(1-value/100))))
-        self.canvas.create_line(points, fill=MINT, width=self.scale(1.4), smooth=False)
+        self.canvas.create_line(points, fill=color, width=self.scale(1.4), smooth=False)
 
-    def draw_battery(self, x, y, value):
+    def draw_battery(self, x, y, value, color=MINT):
         self.rounded(x, y, 30, 17, 3, BG, INK, 1.2)
         self.line(x+32, y+5, x+32, y+12, INK, 2)
         if finite(value) and value > 0:
-            self.rounded(x+3, y+3, max(2, 24*max(0,min(100,value))/100), 11, 1.5, MINT)
+            self.rounded(x+3, y+3, max(2, 24*max(0,min(100,value))/100), 11, 1.5, color)
 
     def draw_fan(self, x, y):
         for angle in (0, 120, 240):
@@ -482,6 +498,7 @@ class Widget:
             if self.last_update and data["_received"] - self.last_update > 15:
                 self.history.clear()
             self.sample = data
+            self.warnings = metric_warnings(data,self.warnings)
             self.last_update = data["_received"]
             for key in ("battery_watts","cpu_temp_c","input_power_w","cpu_power_w","fan_rpm"):
                 if finite(data.get(key)):

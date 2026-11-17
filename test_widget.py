@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import widget
-from telemetry import _LibreSensors, _battery_seconds
+from telemetry import _LibreSensors, _battery_seconds, RemainingTimeEstimator
 
 
 class WidgetFormattingTests(unittest.TestCase):
@@ -13,18 +13,18 @@ class WidgetFormattingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             config = Path(folder)/"settings.json"
             with patch.object(widget,"CONFIG",config):
-                self.assertEqual(widget.load_settings()["zoom"],0.9)
+                self.assertEqual(widget.load_settings()["zoom"],0.85)
                 config.write_text('{"zoom":1.25,"interval":5}',encoding="utf-8")
                 settings = widget.load_settings()
                 self.assertEqual(settings["zoom"],1.25)
                 self.assertEqual(settings["interval"],5)
                 config.write_text('{"zoom":-1}',encoding="utf-8")
-                self.assertEqual(widget.load_settings()["zoom"],0.9)
+                self.assertEqual(widget.load_settings()["zoom"],0.85)
 
     def test_unsupported_sections_are_hidden(self):
         plan = dict(widget.section_plan({"battery":True,"performance_mode":True,"battery_watts":True}))
         self.assertNotIn("fan", plan)
-        self.assertEqual(plan["power"],46)
+        self.assertEqual(plan["power"],44)
         self.assertNotIn("battery",dict(widget.section_plan({})))
     def test_unknown_values_are_not_reported_as_zero(self):
         self.assertEqual(widget.percent(None), "—")
@@ -37,7 +37,50 @@ class WidgetFormattingTests(unittest.TestCase):
         for value in (None, -1, -2, 0, 0xFFFFFFFF, 0xFFFFFFFE, 4294967280, float("inf"), float("nan")):
             self.assertIsNone(widget.duration(value))
             self.assertIsNone(_battery_seconds(value))
-        self.assertEqual(widget.duration(3900), "약 1시간 05분")
+        self.assertEqual(widget.duration(3900), "약 1시간 05분 남음")
+        self.assertEqual(widget.duration(2700), "약 0시간 45분 남음")
+
+    def test_high_usage_and_battery_warnings(self):
+        flags = widget.metric_warnings({"cpu_percent":80,"ram_percent":85,"battery_percent":20})
+        self.assertTrue(flags["cpu_percent"])
+        self.assertTrue(flags["ram_percent"])
+        self.assertTrue(flags["battery"])
+        for direction in ("charging","discharging"):
+            flags = widget.metric_warnings({"battery_percent":80,"battery_watts":60,"battery_power_direction":direction})
+            self.assertFalse(flags["battery"])
+
+    def test_battery_estimate_ignores_a_brief_power_spike(self):
+        estimator = RemainingTimeEstimator()
+        raw = {"capacity_mwh":20000,"rate":-10000,"relative":False}
+        self.assertIsNone(estimator.update(0,raw))
+        self.assertIsNone(estimator.update(6,raw))
+        self.assertEqual(estimator.update(12,raw),7200)
+        spike = dict(raw,rate=-40000)
+        for seconds in (18,24,30,36):
+            self.assertEqual(estimator.update(seconds,spike),7200)
+        estimate = estimator.update(42,spike)
+        self.assertGreater(estimate,1800)
+        self.assertLess(estimate,7200)
+
+    def test_battery_estimate_resets_after_missing_data_sleep_or_source_change(self):
+        estimator = RemainingTimeEstimator()
+        raw = {"capacity_mwh":20000,"rate":-10000,"relative":False}
+        for now in (0,6,12):
+            estimator.update(now,raw)
+        self.assertIsNone(estimator.update(48,raw))
+        self.assertIsNone(estimator.update(54,None,0xFFFFFFFF))
+        self.assertIsNone(estimator.update(60,None,7200))
+        self.assertIsNone(estimator.update(66,None,7200))
+        self.assertEqual(estimator.update(72,None,7200),7200)
+        self.assertIsNone(estimator.update(78,raw))
+
+    def test_warning_hysteresis_and_unknown_values(self):
+        flags = widget.metric_warnings({"cpu_percent":90,"ram_percent":90,"battery_percent":10})
+        held = widget.metric_warnings({"cpu_percent":75,"ram_percent":82,"battery_percent":23},flags)
+        self.assertTrue(held["cpu_percent"] and held["ram_percent"] and held["battery_low"])
+        cleared = widget.metric_warnings({"cpu_percent":70,"ram_percent":80,"battery_percent":25},held)
+        self.assertFalse(any(cleared.values()))
+        self.assertFalse(any(widget.metric_warnings({},flags).values()))
 
     def test_unknown_windows_time_falls_back_to_capacity_over_rate(self):
         raw = {"capacity_mwh":20000,"rate":-10000,"relative":False}
